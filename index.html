@@ -1095,21 +1095,17 @@ function AddBookForm({
   var s8 = useState(""),
     fileName = s8[0],
     setFileName = s8[1];
-  var s9 = useState([]),
-    tocData = s9[0],
-    setTocData = s9[1];
   var handleFile = async function (e) {
     var file = e.target.files[0];
     if (!file) return;
     setFileName(file.name);
-    var text = "";
-    var toc = [];
     if (file.name.endsWith(".txt")) {
-      text = await file.text();
+      var text = await file.text();
+      setFileContent({ type: "txt", text: text });
+      if (!title) setTitle(file.name.replace(/\.txt$/i, ""));
     } else if (file.name.endsWith(".epub")) {
       try {
         var zip = await JSZip.loadAsync(file);
-        // Find content.opf path from container.xml
         var opfPath = "";
         var containerFile = zip.files["META-INF/container.xml"];
         if (containerFile) {
@@ -1123,7 +1119,7 @@ function AddBookForm({
         if (opfPath && zip.files[opfPath]) {
           var opfContent = await zip.files[opfPath].async("string");
           var mMatches = [...opfContent.matchAll(/<item[^>]+id="([^"]+)"[^>]+href="([^"]+)"/g)];
-          mMatches.forEach(function(m) { manifest[m[1]] = opfDir + m[2]; });
+          mMatches.forEach(function(m) { manifest[m[1]] = opfDir + decodeURIComponent(m[2]); });
           var sMatches = [...opfContent.matchAll(/<itemref[^>]+idref="([^"]+)"/g)];
           sMatches.forEach(function(m) { if (manifest[m[1]]) spine.push(manifest[m[1]]); });
         }
@@ -1132,8 +1128,8 @@ function AddBookForm({
             return k.endsWith(".html") || k.endsWith(".xhtml") || k.endsWith(".htm");
           }).sort();
         }
-        // Parse TOC from nav.xhtml or toc.ncx
-        var tocEntries = [];
+        // Parse TOC for chapter titles
+        var fileTitles = {};
         var navKey = Object.keys(zip.files).find(function(k) { return k.endsWith("nav.xhtml") || k.endsWith("nav.html"); });
         if (navKey) {
           var navContent = await zip.files[navKey].async("string");
@@ -1141,10 +1137,10 @@ function AddBookForm({
           navMatches.forEach(function(m) {
             var href = m[1].replace(/^.*\//, "");
             var t = m[2].trim();
-            if (t && href) tocEntries.push({ title: t, href: href });
+            if (t && href) fileTitles[href] = t;
           });
         }
-        if (tocEntries.length === 0) {
+        if (Object.keys(fileTitles).length === 0) {
           var ncxKey = Object.keys(zip.files).find(function(k) { return k.endsWith(".ncx"); });
           if (ncxKey) {
             var ncxContent = await zip.files[ncxKey].async("string");
@@ -1152,50 +1148,32 @@ function AddBookForm({
             ncxMatches.forEach(function(m) {
               var t = m[1].trim();
               var href = m[2].replace(/^.*\//, "");
-              if (t && href) tocEntries.push({ title: t, href: href });
+              if (t && href) fileTitles[href] = t;
             });
           }
         }
-        // Build full text tracking char offsets per file
-        var texts = [];
-        var charOffset = 0;
-        var fileOffsets = {};
+        // One chapter per spine file
+        var epubChapters = [];
         for (var i = 0; i < spine.length; i++) {
           var k = spine[i];
           if (!zip.files[k]) continue;
           var content = await zip.files[k].async("string");
           var stripped = content.replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
-          if (stripped.length > 20) {
-            var fname = k.replace(/^.*\//, "");
-            fileOffsets[fname] = charOffset;
-            texts.push(stripped);
-            charOffset += stripped.length + 2;
-          }
+          if (stripped.length < 20) continue;
+          var fname = k.replace(/^.*\//, "");
+          epubChapters.push({ title: fileTitles[fname] || "", content: stripped });
         }
-        text = texts.join("\n\n");
-        // Map TOC entries to page numbers
-        var seen = new Set();
-        tocEntries.forEach(function(entry) {
-          var offset = fileOffsets[entry.href];
-          if (offset !== undefined) {
-            var page = Math.floor(offset / CHARS_PER_PAGE) + 1;
-            if (!seen.has(page)) { seen.add(page); toc.push({ title: entry.title, page: page }); }
-          }
-        });
-      } catch (e) {
-        alert("EPUB 解析失敗");
+        if (epubChapters.length === 0) { alert("EPUB 解析失敗，未找到内容"); return; }
+        setFileContent({ type: "epub", chapters: epubChapters });
+        if (!title) setTitle(file.name.replace(/\.epub$/i, ""));
+      } catch (err) {
+        alert("EPUB 解析失敗: " + err.message);
         return;
       }
     } else {
       alert("僅支持 .txt 和 .epub 格式");
       return;
     }
-    setTocData(toc);
-    if (!title) {
-      var nameWithoutExt = file.name.replace(/\.(txt|epub)$/i, "");
-      setTitle(nameWithoutExt);
-    }
-    setFileContent(text);
   };
   var searchCover = async function () {
     if (!title.trim()) return;
@@ -1218,20 +1196,23 @@ function AddBookForm({
     if (!title.trim() || !fileContent) return;
     setSubmitting(true);
     var pages = [];
-    var text = fileContent;
-    var pageNum = 1;
-    while (text.length > 0) {
-      var chunk = text.slice(0, CHARS_PER_PAGE);
-      var lastNewline = chunk.lastIndexOf("\n");
-      if (lastNewline > CHARS_PER_PAGE * 0.5 && text.length > CHARS_PER_PAGE) {
-        chunk = text.slice(0, lastNewline + 1);
+    var chapters = [];
+    if (fileContent.type === "txt") {
+      var text = fileContent.text;
+      var pageNum = 1;
+      while (text.length > 0) {
+        var chunk = text.slice(0, CHARS_PER_PAGE);
+        var lastNewline = chunk.lastIndexOf("\n");
+        if (lastNewline > CHARS_PER_PAGE * 0.5 && text.length > CHARS_PER_PAGE) chunk = text.slice(0, lastNewline + 1);
+        pages.push({ page_number: pageNum, content: chunk.trim() });
+        text = text.slice(chunk.length);
+        pageNum++;
       }
-      pages.push({
-        page_number: pageNum,
-        content: chunk.trim()
+    } else {
+      fileContent.chapters.forEach(function(ch, i) {
+        pages.push({ page_number: i + 1, content: ch.content });
+        if (ch.title) chapters.push({ title: ch.title, page: i + 1 });
       });
-      text = text.slice(chunk.length);
-      pageNum++;
     }
     try {
       var book = await api("/books", "POST", {
@@ -1239,7 +1220,7 @@ function AddBookForm({
         author: author.trim(),
         cover_url: coverUrl,
         total_pages: pages.length,
-        chapters: tocData
+        chapters: chapters
       });
       var batchSize = 50;
       for (var i = 0; i < pages.length; i += batchSize) {
